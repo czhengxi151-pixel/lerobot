@@ -154,7 +154,7 @@ class ACTPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         batch = self.normalize_targets(batch)
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat, latent_sample) = self.model(batch)
 
         l1_loss = (
             F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
@@ -170,6 +170,29 @@ class ACTPolicy(PreTrainedPolicy):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
+            posterior_std = log_sigma_x2_hat.mul(0.5).exp()
+            loss_dict.update(
+                {
+                    "latent/mu_mean": mu_hat.mean().item(),
+                    "latent/mu_std": mu_hat.std(unbiased=False).item(),
+                    "latent/log_variance_mean": log_sigma_x2_hat.mean().item(),
+                    "latent/log_variance_std": log_sigma_x2_hat.std(unbiased=False).item(),
+                    "latent/posterior_std_mean": posterior_std.mean().item(),
+                    "latent/z_mean": latent_sample.mean().item(),
+                    "latent/z_std": latent_sample.std(unbiased=False).item(),
+                    "latent/z_min": latent_sample.min().item(),
+                    "latent/z_max": latent_sample.max().item(),
+                    "latent/weighted_kld_loss": (mean_kld * self.config.kl_weight).item(),
+                }
+            )
+            # These tensors are consumed only by TensorBoard at logging steps. Keeping them detached avoids
+            # retaining the autograd graph while still recording the exact latent sample used in this pass.
+            loss_dict["_tensorboard_histograms"] = {
+                "latent/mu": mu_hat.detach(),
+                "latent/log_variance": log_sigma_x2_hat.detach(),
+                "latent/posterior_std": posterior_std.detach(),
+                "latent/z": latent_sample.detach(),
+            }
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
@@ -390,7 +413,9 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Tensor, tuple[Tensor, Tensor, Tensor] | tuple[None, None, Tensor]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -406,8 +431,8 @@ class ACT(nn.Module):
 
         Returns:
             (B, chunk_size, action_dim) batch of action sequences
-            Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
-            latent dimension.
+            Tuple containing the latent PDF's parameters (mean, log(σ²)) and the sampled latent z, all as
+            (B, L) tensors where L is the latent dimension.
         """
         if self.config.use_vae and self.training:
             assert "action" in batch, (
@@ -527,7 +552,7 @@ class ACT(nn.Module):
 
         actions = self.action_head(decoder_out)
 
-        return actions, (mu, log_sigma_x2)
+        return actions, (mu, log_sigma_x2, latent_sample)
 
 
 class ACTEncoder(nn.Module):

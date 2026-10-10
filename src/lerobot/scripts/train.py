@@ -13,7 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import atexit
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -109,6 +111,18 @@ def update_policy(
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
     logging.info(pformat(cfg.to_dict()))
+
+    tensorboard_writer = None
+    if os.environ.get("LEROBOT_TENSORBOARD", "0") == "1":
+        from torch.utils.tensorboard import SummaryWriter
+
+        tensorboard_log_dir = os.environ.get(
+            "LEROBOT_TENSORBOARD_LOGDIR",
+            str(cfg.output_dir / "tensorboard"),
+        )
+        tensorboard_writer = SummaryWriter(log_dir=tensorboard_log_dir)
+        atexit.register(tensorboard_writer.close)
+        logging.info(f"TensorBoard logs: {tensorboard_log_dir}")
 
     if cfg.wandb.enable and cfg.wandb.project:
         wandb_logger = WandBLogger(cfg)
@@ -230,11 +244,35 @@ def train(cfg: TrainPipelineConfig):
 
         if is_log_step:
             logging.info(train_tracker)
+
+            log_dict = train_tracker.to_dict()
+            tensorboard_histograms = {}
+            if output_dict:
+                tensorboard_histograms = output_dict.get("_tensorboard_histograms", {})
+                log_dict.update(
+                    {
+                        metric_name: metric_value
+                        for metric_name, metric_value in output_dict.items()
+                        if metric_name != "_tensorboard_histograms"
+                    }
+                )
+
+            if tensorboard_writer:
+                for metric_name, metric_value in log_dict.items():
+                    if isinstance(metric_value, (int, float)):
+                        tensorboard_writer.add_scalar(f"train/{metric_name}", metric_value, step)
+                for histogram_name, histogram_value in tensorboard_histograms.items():
+                    if isinstance(histogram_value, torch.Tensor):
+                        tensorboard_writer.add_histogram(
+                            f"train/{histogram_name}",
+                            histogram_value.detach().float().cpu(),
+                            step,
+                        )
+                tensorboard_writer.add_scalar("train/amp_scale", grad_scaler.get_scale(), step)
+                tensorboard_writer.flush()
+
             if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    wandb_log_dict.update(output_dict)
-                wandb_logger.log_dict(wandb_log_dict, step)
+                wandb_logger.log_dict(log_dict, step)
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
@@ -273,6 +311,11 @@ def train(cfg: TrainPipelineConfig):
             eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
             eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
             logging.info(eval_tracker)
+            if tensorboard_writer:
+                for metric_name, metric_value in eval_tracker.to_dict().items():
+                    if isinstance(metric_value, (int, float)):
+                        tensorboard_writer.add_scalar(f"eval/{metric_name}", metric_value, step)
+                tensorboard_writer.flush()
             if wandb_logger:
                 wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                 wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
@@ -280,6 +323,8 @@ def train(cfg: TrainPipelineConfig):
 
     if eval_env:
         eval_env.close()
+    if tensorboard_writer:
+        tensorboard_writer.flush()
     logging.info("End of training")
 
     if cfg.policy.push_to_hub:

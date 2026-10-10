@@ -173,3 +173,11 @@ outputs/
 
 # Dev folders
 .cache/*
+
+# Graduation project local datasets and artifacts
+/jasonz/
+/outputs/
+
+# Training artifacts
+events.out.tfevents.*
+*.log
